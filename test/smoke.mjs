@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, copyFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, copyFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -228,14 +228,33 @@ try {
   assert.match(labelMeasure, /label 4l on edge 4 \(text box\): .*anchor \(212,62\)/, "measure must anchor the edge label on its polyline");
   assert.match(labelMeasure, /ink \d/, "measure must find the label's text ink");
 
-  // The webapp silently drops the whole model when a cell id collides with one of
-  // its builtins ("map" is a known case). The render guard must turn that into a
-  // loud failure instead of a blank PNG.
+  // A cell id that collides with a webapp builtin ("map") makes some webapp
+  // versions drop the whole model. The render guard must turn a dropped model
+  // into a loud failure, and a webapp that accepts the id must carry every
+  // cell through, so either outcome is asserted and neither is a free pass.
   writeFileSync(join(dir, "landmine.drawio"), HELLO_DRAWIO.replace('id="2"', 'id="map"'));
-  runExpectingFailure(
-    ["render", join(dir, "landmine.drawio"), "--png", join(dir, "landmine.drawio.png")],
-    "rejected the input silently",
+  const landmine = spawnSync(
+    process.execPath,
+    [cli, "render", join(dir, "landmine.drawio"), "--png", join(dir, "landmine.drawio.png")],
+    { encoding: "utf8" },
   );
+  if (landmine.status === 0) {
+    const carried = run(["extract", join(dir, "landmine.drawio.png"), "-o", join(dir, "landmine-back.drawio")]);
+    assert.equal(carried.status, 0);
+    const back = readFileSync(join(dir, "landmine-back.drawio"), "utf8");
+    assert.ok(back.includes('id="map"'), "a webapp that accepts the poison id must carry its cell through");
+  } else {
+    assert.ok(landmine.stderr.includes("rejected the input silently"), `the guard must name the drop, got:\n${landmine.stderr}`);
+    assert.ok(!existsSync(join(dir, "landmine.drawio.png")), "a refused render writes nothing");
+  }
+
+  // A model whose export would exceed the exporter's canvas limit is refused
+  // before rendering, naming the scale that fits, and nothing is written.
+  writeFileSync(join(dir, "tall.drawio"), HELLO_DRAWIO.replace('<mxGeometry x="240" y="40" width="120" height="60"', '<mxGeometry x="240" y="7000" width="120" height="60"'));
+  runExpectingFailure(["render", join(dir, "tall.drawio"), "--png", join(dir, "tall.drawio.png"), "--scale", "3"], "over the exporter's 16384px canvas limit");
+  assert.ok(!existsSync(join(dir, "tall.drawio.png")), "a refused render writes nothing");
+  run(["render", join(dir, "tall.drawio"), "--png", join(dir, "tall.drawio.png"), "--scale", "2"]);
+  assert.ok(existsSync(join(dir, "tall.drawio.png")), "the fitting scale renders");
 
   // lint: a pinned orthogonal edge passes, a pinned diagonal fails.
   const lintable = (entryX) => `<mxfile><diagram id="l" name="l"><mxGraphModel><root>
@@ -286,9 +305,13 @@ try {
   </root></mxGraphModel></diagram></mxfile>`;
   writeFileSync(join(dir, "selfcross.drawio"), crossing);
   runExpectingFailure(["lint", join(dir, "selfcross.drawio")], "same-colour");
-  // Different colours crossing is legal.
+  // Different colours crossing is legal, and reads as a jump only with jumpStyle on
+  // the edge declared later: without it the crossing warns, so --strict fails.
   writeFileSync(join(dir, "crosscolour.drawio"), crossing.replace('strokeColor=#E73F74;exitX=0.5', 'strokeColor=#3969AC;exitX=0.5'));
-  run(["lint", join(dir, "crosscolour.drawio"), "--strict"]);
+  run(["lint", join(dir, "crosscolour.drawio")]);
+  runExpectingFailure(["lint", join(dir, "crosscolour.drawio"), "--strict"], "different colours cross");
+  writeFileSync(join(dir, "crosscolour-jump.drawio"), crossing.replace('strokeColor=#E73F74;exitX=0.5', 'strokeColor=#3969AC;jumpStyle=arc;exitX=0.5'));
+  run(["lint", join(dir, "crosscolour-jump.drawio"), "--strict"]);
 
   // A cramped lead into the arrowhead (corner 12 units before landing) must fail.
   const cramped = `<mxfile><diagram id="t" name="t"><mxGraphModel><root>
@@ -554,9 +577,12 @@ try {
   assert.match(demoted, /calibration: note residual -?\d+,-?\d+px is within the render border .* attributed to bound-setting edges/, `an edge-attributed residual inside the border must demote to a note, got:\n${demoted}`);
   assert.ok(!demoted.includes("WARNING"), `a demoted residual must not also warn, got:\n${demoted}`);
   // Small but unattributed (the bound-setters are vertices, nothing explains
-  // the shift): never demoted, since nothing has explained it.
-  const vague = run(["measure", join(dir, "measured.drawio.png"), "--cell", "padded", "--scale", "3", "--border", "12"]).stdout;
+  // the shift): never demoted, since nothing has explained it. A border
+  // misstated by four units shifts both axes by the same twelve pixels past
+  // the stroke slack, which is the signature the warning names.
+  const vague = run(["measure", join(dir, "measured.drawio.png"), "--cell", "padded", "--scale", "3", "--border", "14"]).stdout;
   assert.ok(vague.includes("calibration: WARNING") && vague.includes("Bounds are set by"), `an unattributed residual must stay a warning, got:\n${vague}`);
+  assert.ok(vague.includes("misstated border"), `a uniform shift must name the misstated border, got:\n${vague}`);
   // --quiet-calibration drops the line and the note, and keeps the warning: it
   // is the error bar on every number under it.
   const quiet = run(["measure", ebPng, "--cell", "a", "--scale", "3", "--border", "25", "--quiet-calibration"]).stdout;
@@ -564,10 +590,12 @@ try {
   assert.ok(quiet.includes("cell a: box"), "--quiet-calibration must keep the measurements");
   const quietLoud = run(["measure", ohPng, "--cell", "a", "--scale", "3", "--border", "10", "--quiet-calibration"]).stdout;
   assert.ok(quietLoud.includes("calibration: WARNING"), `--quiet-calibration must never hide a warning, got:\n${quietLoud}`);
-  // --affine is refused while a live WARNING stands: an unexplained shift
-  // would be baked into the offsets it publishes.
-  const refused = run(["measure", ohPng, "--affine", "--scale", "3", "--border", "10"]).stdout;
-  assert.ok(refused.includes("affine: refused while a live calibration WARNING"), `--affine must refuse under a live warning, got:\n${refused}`);
+  // --affine under a live WARNING prints the mapping with the residual named
+  // as its error bar, so a crop still has numbers and knows how far they may be off.
+  const barred = run(["measure", ohPng, "--affine", "--scale", "3", "--border", "10"]).stdout;
+  assert.ok(barred.includes("calibration: WARNING"), `the misstated border must still warn, got:\n${barred}`);
+  assert.match(barred, /affine: error bar \d+,\d+px \(the live calibration WARNING above\)/, `--affine must name its error bar, got:\n${barred}`);
+  assert.match(barred, /affine x: px = /, `--affine must still print the mapping, got:\n${barred}`);
 
   console.log("smoke test passed");
 } finally {

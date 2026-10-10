@@ -24,6 +24,15 @@ const POISON_IDS = new Set(["map", "filter", "target", "constructor", "proto", "
 // by a parenthesised argument list. Such a label is code, not a description, so
 // the "bold actor prefix, capitalised body" format does not apply to it.
 const CODE_LABEL = /^[A-Za-z_$][\w$.]*\([^()]*\)$/;
+// A bare dotted identifier (an interface or type name) is code too where a
+// project's config says so (`codeLabels: "identifier"`).
+const IDENTIFIER_LABEL = /^[A-Za-z_$][\w$.<>\[\]| ]*$/;
+
+/** The code-label modes `lint.codeLabels` accepts. */
+export const CODE_LABEL_MODES = ["call", "identifier"];
+
+/** The advisory content budget in model units, at which default-font text stays legible at README width. */
+export const WORKING_SIZE = { w: 1300, h: 800 };
 
 // Every switch here holds an attribute to the exact characters the file spells
 // it with, which the whole model view depends on: entities stay encoded (a
@@ -97,6 +106,31 @@ function styleMap(style) {
     else out[part.slice(0, eq)] = part.slice(eq + 1);
   }
   return out;
+}
+
+// Tokens that place or route a cell rather than style it: they vary per cell
+// by design (a pinned route makes the router's edgeStyle inert, a jump is
+// chosen per crossing), so they never decide whether a cell was copied from
+// the palette.
+const PLACEMENT_TOKENS = new Set([
+  "spacing", "spacingTop", "spacingLeft", "spacingRight", "spacingBottom",
+  "exitX", "exitY", "exitDx", "exitDy", "entryX", "entryY", "entryDx", "entryDy",
+  "points", "size", "startSize", "labelPosition", "verticalLabelPosition", "verticalAlign", "align",
+  "edgeStyle", "jumpStyle", "jumpSize",
+]);
+
+/**
+ * A cell's style with its placement tokens dropped, its image payload elided
+ * and its tokens sorted, so two cells copied from one palette entry share one
+ * family whatever their size, seat or token order.
+ */
+export function styleFamily(style) {
+  const tokens = [];
+  for (const [key, value] of Object.entries(styleMap(style))) {
+    if (PLACEMENT_TOKENS.has(key)) continue;
+    tokens.push(key === "image" && value.startsWith("data:") ? `image=${value.split(",")[0]},...` : value === "" ? key : `${key}=${value}`);
+  }
+  return tokens.sort().join(";");
 }
 
 /**
@@ -423,11 +457,34 @@ function segmentCrossesBox(a, b, box) {
 }
 
 /**
- * Lints the given mxfile XML. Returns {errors, warnings}, each an array of
- * strings. Edges with floating (unpinned) connection points are warnings:
+ * Lints the given mxfile XML. Returns {errors, warnings, notes}, each an array
+ * of strings. Edges with floating (unpinned) connection points are warnings:
  * their geometry cannot be verified statically until pinned.
+ *
+ * The universal checks run on every call. `options` carries a repository's
+ * own vocabulary from its drawio.config.json and switches on the checks that
+ * need it; with no options the result is the universal checks alone.
+ *
+ * @param xml - Uncompressed mxfile XML.
+ * @param options.labelFormat - "strict" (the default) runs the edge-label
+ *   format check, "off" skips it and says so in a note.
+ * @param options.verbs - When set, an edge label's body must open with one of
+ *   these words (error tier).
+ * @param options.subjects - When set, an edge label's first line, colon
+ *   stripped, must be one of these (error tier).
+ * @param options.paletteStyles - When set, every styled cell's style family
+ *   (see {@link styleFamily}) must be one of these (warning tier).
+ * @param options.codeLabels - "call" (the default) exempts a whole-text call
+ *   expression from the format check, "identifier" also exempts a bare
+ *   identifier or type name.
  */
-export function lint(xml) {
+export function lint(xml, options = {}) {
+  const labelFormat = options.labelFormat ?? "strict";
+  const verbs = options.verbs ?? null;
+  const subjects = options.subjects ?? null;
+  const paletteStyles = options.paletteStyles ?? null;
+  const codeLabels = options.codeLabels ?? "call";
+  const isCodeLabel = (whole) => CODE_LABEL.test(whole) || (codeLabels === "identifier" && IDENTIFIER_LABEL.test(whole) && !/\s/.test(whole.trim()));
   const errors = [], warnings = [];
   const { cells, ids } = parseModel(xml);
   const edges = [...cells.values()].filter((c) => c.attrs.edge === "1");
@@ -580,13 +637,28 @@ export function lint(xml) {
   // Two edges of the same colour (the same step) must never properly cross each
   // other. A T-junction, an endpoint landing ON the other run, is the sanctioned
   // shared-trunk fan-out and is excluded by the strict-interior margins.
+  // A crossing of two DIFFERENT colours reads as a jump only when one of the
+  // two edges carries jumpStyle, and the hop renders on whichever of them the
+  // file declares later. Token presence is exact, the hop itself is eyeball.
+  const jumpless = new Set();
   for (let i = 0; i < runs.length; i += 1) for (let j = 0; j < runs.length; j += 1) {
     const v = runs[i], h = runs[j];
-    if (!v.vertical || h.vertical || v.edge === h.edge || v.colour !== h.colour) continue;
+    if (!v.vertical || h.vertical || v.edge === h.edge) continue;
     const M = 0.5;
-    if (v.coord > h.lo + M && v.coord < h.hi - M && h.coord > v.lo + M && h.coord < v.hi - M) {
+    const crosses = v.coord > h.lo + M && v.coord < h.hi - M && h.coord > v.lo + M && h.coord < v.hi - M;
+    if (!crosses) continue;
+    if (v.colour === h.colour) {
       errors.push(
         `edges ${v.edge} and ${h.edge}: same-colour (${v.colour}) edges cross at (${v.coord},${h.coord}), share a base or reroute`,
+      );
+      continue;
+    }
+    const hasJump = (id) => cells.get(id)?.style.jumpStyle !== undefined;
+    const key = [v.edge, h.edge].sort().join("+");
+    if (!hasJump(v.edge) && !hasJump(h.edge) && !jumpless.has(key)) {
+      jumpless.add(key);
+      warnings.push(
+        `edges ${v.edge} and ${h.edge}: different colours cross at (${v.coord},${h.coord}) with no jumpStyle on either, so the crossing reads as a junction: put jumpStyle=arc on the edge declared later in the file, where the hop renders`,
       );
     }
   }
@@ -619,9 +691,54 @@ export function lint(xml) {
     }
   }
 
+  const notes = [...stackNotes, ...clearanceNotes];
+
+  // A stack-layout container is authored blind: the webapp recomputes nothing
+  // at render, so a row out of sequence or a short container is a real gap or
+  // overlap on the page. Exact geometry, warning tier.
+  for (const c of cells.values()) {
+    if (c.attrs.vertex !== "1" || !c.geo || c.style.childLayout !== "stackLayout") continue;
+    const rows = [...cells.values()]
+      .filter((k) => k.attrs.parent === c.id && k.attrs.vertex === "1" && k.geo)
+      .sort((p, q) => Number(p.geo.y ?? 0) - Number(q.geo.y ?? 0));
+    if (rows.length === 0) continue;
+    let expected = Number(c.style.startSize ?? 0);
+    for (const row of rows) {
+      const y = Number(row.geo.y ?? 0);
+      if (Math.abs(y - expected) > 0.01) {
+        warnings.push(`cell ${c.id}: stack row ${row.id} starts at y=${y}, the previous row ends at ${expected}: rows of a stackLayout container are contiguous`);
+      }
+      expected = y + Number(row.geo.height ?? 0);
+    }
+    const wanted = expected + Number(c.style.marginBottom ?? 0);
+    const height = Number(c.geo.height ?? 0);
+    if (Math.abs(height - wanted) > 0.01) {
+      warnings.push(`cell ${c.id}: stackLayout container is ${height}u tall, its rows end at ${wanted}u: size the container to its rows`);
+    }
+  }
+
+  // A coloured edge is a step or transition and describes itself with a label;
+  // a bundle segment continuing a labelled arrow is legitimate, so a note.
+  for (const e of edges) {
+    const colour = e.style.strokeColor ?? "default";
+    if (colour === "default" || colour === "none" || isSpecimenEdge(cells, e)) continue;
+    const labelled = [...cells.values()].some((k) => k.attrs.parent === e.id && k.attrs.vertex === "1" && (k.attrs.value ?? "").trim() !== "");
+    if (!labelled) notes.push(`edge ${e.id}: coloured (${colour}) edge carries no label, so the reader infers its action from its endpoints (a bundle segment continuing a labelled arrow is the one legitimate case)`);
+  }
+
+  // The working-size budget is advisory: a forced overrun is accepted, slack is not.
+  try {
+    const mb = modelBounds(cells);
+    const w = Math.round(mb.maxX - mb.minX), h = Math.round(mb.maxY - mb.minY);
+    if (w > WORKING_SIZE.w || h > WORKING_SIZE.h) {
+      notes.push(`working size: content spans ${w}x${h} model units, over the advisory ${WORKING_SIZE.w}x${WORKING_SIZE.h} budget: tighten, split, or confirm the overrun is forced`);
+    }
+  } catch {
+    // A model with no geometry has no size to judge.
+  }
+
   // Advisory only: a monospace code cell much wider than its text suggests the box
   // is not hugging its content. Char-count estimate, so these never fail a run.
-  const notes = [...stackNotes, ...clearanceNotes];
   for (const c of cells.values()) {
     if (c.attrs.vertex !== "1" || !c.geo || !c.attrs.value) continue;
     if (cells.get(c.attrs.parent)?.attrs.edge === "1") continue; // riding labels size themselves
@@ -651,6 +768,22 @@ export function lint(xml) {
         `cell ${c.id}: token "${longestToken.slice(0, 30)}" is ~${Math.round(tokenW)}u wide in a ${width}u box, ` +
           `likely overflowing it (an unbreakable token ignores wrapping)`,
       );
+    }
+    // A line wider than the box wraps at a space, and under overflow=hidden the
+    // pushed-down last line vanishes. Estimate tier, so a note.
+    // A box tall enough for one more line accommodates the wrap by design, so
+    // only a box with no room for it is noted.
+    const height = Number(c.geo.height ?? 0);
+    const roomForAnotherLine = height >= (lines.length + 1) * 16;
+    if (c.style.whiteSpace === "wrap" && !roomForAnotherLine) {
+      const inner = width - Number(c.style.spacingLeft ?? c.style.spacing ?? 0) - Number(c.style.spacingRight ?? c.style.spacing ?? 0) - 4;
+      const widest = lines.reduce((a, l) => (estimateAdvance(l.text, menlo) > estimateAdvance(a.text, menlo) ? l : a));
+      const lineW = estimateAdvance(widest.text, menlo);
+      if (lineW > inner * 1.15 && lineW > tokenW) {
+        notes.push(
+          `cell ${c.id}: line "${widest.text.slice(0, 40)}" is ~${Math.round(lineW)}u wide for ${Math.round(inner)}u of box, likely wrapping (a wrapped last line hides under overflow=hidden)`,
+        );
+      }
     }
   }
   // Advisory only: edge labels have no committed geometry, so their boxes are
@@ -763,14 +896,14 @@ export function lint(xml) {
   // party, bold and colon-terminated, and its body opens with a capital. A
   // legend caption on a specimen edge names a style, has no acting party, and
   // is exempt.
-  let formatted = 0;
+  let formatted = 0, vocabChecked = 0;
   for (const { cell, edge, specimen } of labelCells) {
-    if (specimen) continue;
+    if (specimen || labelFormat === "off") continue;
     formatted += 1;
     const lines = renderedLines(cell.attrs.value);
     if (lines.length === 0) continue;
     const whole = lines.map((l) => l.text).join(" ");
-    if (CODE_LABEL.test(whole)) continue; // a call expression is code, not a description
+    if (isCodeLabel(whole)) continue; // a call expression (or, when configured, a bare identifier) is code, not a description
     const body = lines.slice(1).map((l) => l.text).join(" ").trim();
     const faults = [];
     if (lines[0].bold !== lines[0].text) faults.push(`its first line "${lines[0].text}" is not fully bold`);
@@ -778,7 +911,39 @@ export function lint(xml) {
     if (body === "") faults.push("it has no body under its first line");
     else if (!/^\p{Lu}/u.test(body)) faults.push(`its body "${body.slice(0, 24)}" does not start with a capital letter`);
     if (faults.length > 0) {
-      errors.push(`label ${cell.id} ("${whole.slice(0, 30)}") on edge ${edge}: ${faults.join(", and ")}. An edge label reads as a bold colon-terminated actor over a capitalised body, and only a whole-text call expression (identifier immediately followed by parentheses) is exempt as a code label`);
+      errors.push(`label ${cell.id} ("${whole.slice(0, 30)}") on edge ${edge}: ${faults.join(", and ")}. An edge label reads as a bold colon-terminated subject over a capitalised body, and only a whole-text call expression (identifier immediately followed by parentheses) is exempt as a code label`);
+      continue;
+    }
+    // The repository's vocabulary, checked only on a label whose shape is
+    // right: a subject is the first line without its colon, a verb is the
+    // body's first word.
+    vocabChecked += 1;
+    const subject = lines[0].text.slice(0, -1);
+    if (subjects !== null && !subjects.includes(subject)) {
+      errors.push(`label ${cell.id} ("${whole.slice(0, 30)}") on edge ${edge}: subject "${subject}" is not in the config's lint.subjects (${subjects.join(", ")})`);
+    }
+    const verb = body.split(/\s+/)[0];
+    if (verbs !== null && !verbs.includes(verb)) {
+      errors.push(`label ${cell.id} ("${whole.slice(0, 30)}") on edge ${edge}: verb "${verb}" is not in the config's lint.verbs (${verbs.join(", ")}), extend the verb table or use a listed verb`);
+    }
+  }
+  if (labelFormat === "off") {
+    notes.push("label format: switched off by the config (lint.labelFormat is \"off\"), so the format, subject and verb checks inspected nothing");
+  }
+
+  // The palette check: a cell styled outside the copy-source card was restyled
+  // by hand. Placement tokens vary legitimately per cell and are stripped by
+  // styleFamily, so the comparison is on what a cell IS, not where it sits.
+  let paletteChecked = 0;
+  if (paletteStyles !== null) {
+    const families = new Set(paletteStyles.map(styleFamily));
+    for (const c of cells.values()) {
+      if (!c.attrs.style) continue;
+      paletteChecked += 1;
+      const family = styleFamily(c.attrs.style);
+      if (!families.has(family)) {
+        warnings.push(`cell ${c.id}: style family "${family.slice(0, 80)}" appears nowhere in the palette, copy the cell from the palette instead of restyling by hand`);
+      }
     }
   }
 
@@ -804,7 +969,13 @@ export function lint(xml) {
   } else {
     if (seated === 0) notes.push("golden rules: 0 edge labels resolved onto a run of their own edge, so the run-through-centre check inspected nothing (vacuous, not green)");
     if (aligned === 0) notes.push(`golden rules: 0 edge labels reached the alignment check (${exempt}), so it inspected nothing (vacuous, not green)`);
-    if (formatted === 0) notes.push(`golden rules: 0 edge labels reached the format check (${exempt}), so it inspected nothing (vacuous, not green)`);
+    if (formatted === 0 && labelFormat !== "off") notes.push(`golden rules: 0 edge labels reached the format check (${exempt}), so it inspected nothing (vacuous, not green)`);
+    if ((verbs !== null || subjects !== null) && vocabChecked === 0 && labelFormat !== "off") {
+      notes.push("vocabulary: 0 well-formed edge labels reached the subject and verb checks, so they inspected nothing (vacuous, not green)");
+    }
+  }
+  if (paletteStyles !== null && paletteChecked === 0) {
+    notes.push("palette: this diagram carries 0 styled cells, so the palette check inspected nothing (vacuous, not green)");
   }
   if (valued === 0) {
     notes.push("editor junk: this diagram carries 0 cell values, so the check inspected nothing (vacuous, not green)");

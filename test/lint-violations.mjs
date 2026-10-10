@@ -139,4 +139,105 @@ const BASE = box("a", 0, 300) + box("b", 900, 300);
   assert.ok(has(result.notes, "vacuous, not green"), "vacuity note must appear");
 }
 
+{ // Vocabulary from the config: an off-list verb and an off-list subject fire,
+  // listed ones pass, and a diagram with no well-formed label says the checks were vacuous.
+  const labelled = (text) => wrap(BASE + edge("e", "a", "b", PIN_LR, "", ridingLabel("el", "e", text)));
+  const vocab = { verbs: ["Reads", "Posts"], subjects: ["MPC", "dApp"] };
+  const bad = lint(labelled("&lt;b&gt;User:&lt;/b&gt;&lt;br&gt;Taps the button"), vocab);
+  assert.ok(has(bad.errors, 'verb "Taps" is not in the config'), "off-list verb must fire");
+  assert.ok(has(bad.errors, 'subject "User" is not in the config'), "off-list subject must fire");
+  const good = lint(labelled("&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Reads the request"), vocab);
+  assert.ok(lacks(good.errors, "is not in the config"), "listed verb and subject must pass");
+  const none = lint(labelled("just some words"), vocab);
+  assert.ok(has(none.notes, "vocabulary: 0 well-formed edge labels"), "vocabulary vacuity must be named");
+  const unconfigured = lint(labelled("&lt;b&gt;User:&lt;/b&gt;&lt;br&gt;Taps the button"));
+  assert.ok(lacks(unconfigured.errors, "is not in the config"), "no config means no vocabulary check");
+}
+
+{ // labelFormat "off" skips the format check and says so; "strict" is the default.
+  const malformed = wrap(BASE + edge("e", "a", "b", PIN_LR, "", ridingLabel("el", "e", "just some words")));
+  const off = lint(malformed, { labelFormat: "off" });
+  assert.ok(lacks(off.errors, "not fully bold"), "format check must be skipped");
+  assert.ok(has(off.notes, "switched off by the config"), "the switch-off must be named");
+  assert.ok(lacks(off.notes, "reached the format check"), "a switched-off check is not vacuous, it is off");
+  const strict = lint(malformed, { labelFormat: "strict" });
+  assert.ok(has(strict.errors, "not fully bold"), "strict must fire");
+}
+
+{ // Palette: a cell styled outside the palette warns, a copied one passes
+  // whatever its placement tokens, and a diagram with no styled cell is vacuous.
+  const palette = ["rounded=0;whiteSpace=wrap;html=1;", "html=1;strokeWidth=2;"];
+  const copied = wrap(box("a", 0, 0, 120, 40, "", "rounded=0;whiteSpace=wrap;html=1;spacingLeft=34;") + box("b", 300, 0) +
+    edge("e", "a", "b", PIN_LR));
+  const good = lint(copied, { paletteStyles: palette });
+  assert.ok(lacks(good.warnings, "appears nowhere in the palette"), "placement tokens must not fail the palette check");
+  const restyled = lint(wrap(box("a", 0, 0, 120, 40, "", "rounded=0;whiteSpace=wrap;html=1;fillColor=#ff0000;")), { paletteStyles: palette });
+  assert.ok(has(restyled.warnings, "cell a: style family"), "hand restyle must warn");
+  const empty = lint(wrap(`<mxCell id="bare" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry" /></mxCell>`), { paletteStyles: palette });
+  assert.ok(has(empty.notes, "palette: this diagram carries 0 styled cells"), "palette vacuity must be named");
+  const unconfigured = lint(restyled === null ? "" : wrap(box("a", 0, 0, 120, 40, "", "rounded=0;html=1;fillColor=#ff0000;")));
+  assert.ok(lacks(unconfigured.warnings, "appears nowhere in the palette"), "no palette means no palette check");
+}
+
+{ // Wrap note: a single-line box narrower than its line notes, a box with room
+  // for another line and a box that fits stay quiet.
+  const long = "a line of text that is far wider than its narrow box allows";
+  const bad = lint(wrap(box("t", 0, 0, 120, 20, long, "rounded=0;whiteSpace=wrap;html=1;")));
+  assert.ok(has(bad.notes, "likely wrapping"), "wrap note must fire");
+  const roomy = lint(wrap(box("t", 0, 0, 120, 60, long, "rounded=0;whiteSpace=wrap;html=1;")));
+  assert.ok(lacks(roomy.notes, "likely wrapping"), "a box with room for another line must stay quiet");
+  const fits = lint(wrap(box("t", 0, 0, 400, 20, long, "rounded=0;whiteSpace=wrap;html=1;")));
+  assert.ok(lacks(fits.notes, "likely wrapping"), "a wide enough box must stay quiet");
+}
+
+{ // Stack layout: a gap between rows and a short container warn, a hugging stack stays quiet.
+  const stack = (rows, height) =>
+    `<mxCell id="s" value="" style="swimlane;childLayout=stackLayout;horizontal=1;startSize=40;marginBottom=0;html=1;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="200" height="${height}" as="geometry" /></mxCell>` +
+    rows.map(([id, y, h]) => `<mxCell id="${id}" value="${id}" style="text;html=1;" vertex="1" parent="s"><mxGeometry y="${y}" width="200" height="${h}" as="geometry" /></mxCell>`).join("");
+  const good = lint(wrap(stack([["r1", 40, 30], ["r2", 70, 30]], 100)));
+  assert.ok(lacks(good.warnings, "stack"), "a hugging stack must stay quiet");
+  const gap = lint(wrap(stack([["r1", 40, 30], ["r2", 80, 30]], 110)));
+  assert.ok(has(gap.warnings, "stack row r2 starts at y=80, the previous row ends at 70"), "a row gap must warn");
+  const short = lint(wrap(stack([["r1", 40, 30], ["r2", 70, 30]], 90)));
+  assert.ok(has(short.warnings, "stackLayout container is 90u tall, its rows end at 100u"), "a short container must warn");
+}
+
+{ // Cross-colour crossing: no jumpStyle on either edge warns, a token on either stays quiet.
+  const cross = (hStyle, vStyle) =>
+    wrap(BASE + box("c", 440, 0, 40, 40) + box("d", 440, 600, 40, 40) +
+      edge("h", "a", "b", PIN_LR + hStyle) +
+      edge("v", "c", "d", "html=1;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" + vStyle));
+  const bad = lint(cross("strokeColor=#E73F74;", "strokeColor=#3969AC;"));
+  assert.ok(has(bad.warnings, "different colours cross"), "a jumpless cross-colour crossing must warn");
+  const hop = lint(cross("strokeColor=#E73F74;", "strokeColor=#3969AC;jumpStyle=arc;"));
+  assert.ok(lacks(hop.warnings, "different colours cross"), "a crossing with a jump must stay quiet");
+  const same = lint(cross("strokeColor=#E73F74;", "strokeColor=#E73F74;"));
+  assert.ok(has(same.errors, "same-colour"), "a same-colour crossing stays an error");
+}
+
+{ // Unlabelled coloured edge notes, a labelled one and a neutral one stay quiet.
+  const bare = lint(wrap(BASE + edge("e", "a", "b", PIN_LR + "strokeColor=#E73F74;")));
+  assert.ok(has(bare.notes, "coloured (#E73F74) edge carries no label"), "an unlabelled coloured edge must note");
+  const labelled = lint(wrap(BASE + edge("e", "a", "b", PIN_LR + "strokeColor=#E73F74;", "", ridingLabel("el", "e", "&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Reads it"))));
+  assert.ok(lacks(labelled.notes, "carries no label"), "a labelled coloured edge must stay quiet");
+  const neutral = lint(wrap(BASE + edge("e", "a", "b", PIN_LR)));
+  assert.ok(lacks(neutral.notes, "carries no label"), "a neutral edge must stay quiet");
+}
+
+{ // Working size: content past the advisory budget notes, content within it stays quiet.
+  const big = lint(wrap(box("a", 0, 0) + box("b", 1400, 0)));
+  assert.ok(has(big.notes, "working size: content spans 1520x40"), "an oversized model must note its size");
+  const small = lint(wrap(box("a", 0, 0) + box("b", 600, 0)));
+  assert.ok(lacks(small.notes, "working size"), "an in-budget model must stay quiet");
+}
+
+{ // Code labels: a bare identifier passes under "identifier" and fails under "call".
+  const ident = wrap(BASE + edge("e", "a", "b", PIN_LR, "", ridingLabel("el", "e", "TransactionLedger")));
+  assert.ok(has(lint(ident).errors, "not fully bold"), "a bare identifier fails the format check by default");
+  assert.ok(has(lint(ident, { codeLabels: "call" }).errors, "not fully bold"), "and under call");
+  assert.ok(lacks(lint(ident, { codeLabels: "identifier" }).errors, "not fully bold"), "a bare identifier is code under identifier");
+  const prose = wrap(BASE + edge("e", "a", "b", PIN_LR, "", ridingLabel("el", "e", "just some words")));
+  assert.ok(has(lint(prose, { codeLabels: "identifier" }).errors, "not fully bold"), "prose with spaces is never an identifier");
+}
+
 console.log("lint-violations: all planted violations fired, all controls stayed quiet");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -352,7 +352,6 @@ try {
     passed += 1;
     console.log("ok  lint: --strict is accepted");
 
-    failsLoudly("lint: refuses a second positional", ["lint", source, source], `unexpected argument: ${source}`);
     failsLoudly("lint: refuses an unknown flag", ["lint", source, "--picky"], "unexpected argument: --picky");
   }
 
@@ -527,6 +526,167 @@ try {
     assert.ok(!refused.stderr.includes("ERR_MODULE_NOT_FOUND"), `render must not leak a module-not-found stack, got:\n${refused.stderr}`);
     passed += 1;
     console.log("ok  render: fails with the doctor guidance without playwright");
+  }
+
+  { // An export saved under a .drawio name holds no source XML: every reading
+    // and editing verb refuses it by content, and extract still recovers the model.
+    const svgAsSource = join(dir, "export.drawio");
+    writeFileSync(svgAsSource, `<svg xmlns="http://www.w3.org/2000/svg" content="${FIXTURE.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"></svg>`);
+    for (const verb of [["lint"], ["cells"], ["styles"], ["set-geometry", "x", "--x", "1"]]) {
+      failsLoudly(`${verb[0]}: refuses an SVG export saved as .drawio`, [verb[0], svgAsSource, ...verb.slice(1)], "an SVG export saved under a .drawio name");
+    }
+    const pngAsSource = join(dir, "shot.drawio");
+    writeFileSync(pngAsSource, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]));
+    failsLoudly("lint: refuses a PNG saved as .drawio", ["lint", pngAsSource], "a PNG export saved under a .drawio name");
+    succeeds("extract: still reads the SVG export saved as .drawio", ["extract", svgAsSource, "-o", join(dir, "recovered.drawio")]);
+  }
+
+  { // lint over several inputs: one summary per file, the exit code aggregated.
+    const packed = join(dir, "packed.drawio");
+    writeFileSync(packed, compressedMxfile(COMPRESSED_MODEL));
+    const clean = join(dir, "clean.drawio");
+    writeFileSync(clean, FIXTURE.replace(/<mxCell id="e"[\s\S]*?<\/mxCell>\s*<mxCell id="el"[\s\S]*?<\/mxCell>/, ""));
+    const both = invoke(["lint", clean, packed]);
+    assert.equal(both.status, 1, `multi-file lint must fail when one input fails\n${both.stderr}`);
+    assert.match(both.stdout, /== .*clean\.drawio\n0 error\(s\)/, "the clean file gets its own header and summary");
+    assert.match(both.stdout, /== .*packed\.drawio\n1 error\(s\)/, "the failing file gets its own header and summary");
+    passed += 1;
+    console.log("ok  lint: several inputs aggregate their exit code");
+    const one = succeeds("lint: a single input prints no header", ["lint", clean]);
+    assert.ok(!one.stdout.includes("=="), "single-input lint must not print a header");
+  }
+
+  { // lint config flags: --config names a file, --no-config ignores every file,
+    // and a config that fails validation fails the run before any report.
+    failsLoudly("lint: --config requires a path", ["lint", source, "--config"], "--config requires a path");
+    failsLoudly("lint: --config names a missing file", ["lint", source, "--config", join(dir, "absent.json")], "no such config file");
+    const badFormat = join(dir, "bad-format.json");
+    writeFileSync(badFormat, JSON.stringify({ lint: { labelFormat: "loose" } }));
+    failsLoudly("lint: rejects an unknown labelFormat", ["lint", source, "--config", badFormat], "lint.labelFormat must be one of strict, off");
+    const badVerbs = join(dir, "bad-verbs.json");
+    writeFileSync(badVerbs, JSON.stringify({ lint: { verbs: "Reads" } }));
+    failsLoudly("lint: rejects verbs that are not a list", ["lint", source, "--config", badVerbs], "lint.verbs must be an array of non-empty strings");
+    const badPalette = join(dir, "bad-palette.json");
+    writeFileSync(badPalette, JSON.stringify({ lint: { palette: "" } }));
+    failsLoudly("lint: rejects an empty palette path", ["lint", source, "--config", badPalette], "lint.palette must be a path");
+    const gonePalette = join(dir, "gone-palette.json");
+    writeFileSync(gonePalette, JSON.stringify({ lint: { palette: "nowhere.drawio" } }));
+    failsLoudly("lint: names a palette file that does not exist", ["lint", source, "--config", gonePalette], "which does not exist");
+    const vocab = join(dir, "vocab.json");
+    writeFileSync(vocab, JSON.stringify({ lint: { verbs: ["Posts"], palette: "fixture.drawio" } }));
+    const applied = invoke(["lint", source, "--config", vocab]);
+    assert.equal(applied.status, 1, `the config's verb list must apply\n${applied.stderr}`);
+    assert.match(applied.stderr, /config: .*vocab\.json/, "the applied config is announced");
+    assert.match(applied.stderr, /verb "Reads" is not in the config/, "the off-list verb fires");
+    passed += 1;
+    console.log("ok  lint: --config applies the named file");
+    const ignored = succeeds("lint: --no-config ignores the config", ["lint", join(dir, "clean.drawio"), "--no-config"]);
+    assert.ok(!ignored.stderr.includes("config:"), "--no-config must announce no config");
+  }
+
+  { // Per-file vocabulary: one config, two entries, each diagram gets its own.
+    const vocabDir = join(dir, "vocab");
+    mkdirSync(join(vocabDir, "docs"), { recursive: true });
+    writeFileSync(join(vocabDir, "drawio.config.json"), JSON.stringify({
+      lint: {
+        verbs: ["Reads"],
+        files: [
+          { match: "docs/*-flow.drawio", verbs: ["Calls"], codeLabels: "identifier" },
+          { match: "docs/**/*.drawio", labelFormat: "off" },
+        ],
+      },
+    }));
+    const labelled = (value) => FIXTURE.replace("&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Reads the ledger", value);
+    writeFileSync(join(vocabDir, "docs", "a-flow.drawio"), labelled("&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Calls the ledger"));
+    mkdirSync(join(vocabDir, "other"), { recursive: true });
+    writeFileSync(join(vocabDir, "other", "plain.drawio"), labelled("&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Calls the ledger"));
+    mkdirSync(join(vocabDir, "docs", "deep"), { recursive: true });
+    writeFileSync(join(vocabDir, "docs", "deep", "state.drawio"), labelled("just some words"));
+    const flow = invoke(["lint", join(vocabDir, "docs", "a-flow.drawio")]);
+    assert.ok(!flow.stderr.includes('verb "Calls"'), `the flow entry's verbs apply:\n${flow.stderr}`);
+    assert.match(flow.stderr, /lint\.files entry "docs\/\*-flow\.drawio" applies/, "the applied entry is announced");
+    const plain = invoke(["lint", join(vocabDir, "other", "plain.drawio")]);
+    assert.match(plain.stderr, /verb "Calls" is not in the config/, "the top-level verbs apply where no entry matches");
+    const deep = invoke(["lint", join(vocabDir, "docs", "deep", "state.drawio")]);
+    assert.ok(!deep.stderr.includes("not fully bold"), `labelFormat off applies through the ** entry:\n${deep.stderr}`);
+    assert.match(deep.stderr, /switched off by the config/);
+    passed += 1;
+    console.log("ok  lint: lint.files entries apply per diagram");
+    const identLabel = join(vocabDir, "docs", "ident-flow.drawio");
+    writeFileSync(identLabel, labelled("TransactionLedger"));
+    const ident = invoke(["lint", identLabel]);
+    assert.ok(!ident.stderr.includes("not fully bold"), `a bare identifier is a code label under the flow entry:\n${ident.stderr}`);
+    passed += 1;
+    console.log("ok  lint: codeLabels identifier applies through a lint.files entry");
+    const badMode = join(dir, "bad-mode.json");
+    writeFileSync(badMode, JSON.stringify({ lint: { codeLabels: "anything" } }));
+    failsLoudly("lint: rejects an unknown codeLabels mode", ["lint", source, "--config", badMode], "codeLabels must be one of call, identifier");
+    const badFiles = join(dir, "bad-files.json");
+    writeFileSync(badFiles, JSON.stringify({ lint: { files: [{ verbs: ["Reads"] }] } }));
+    failsLoudly("lint: rejects a files entry without a match", ["lint", source, "--config", badFiles], "lint.files[0].match must be a glob");
+  }
+
+  { // --palette overrides the config's palette for one run.
+    const trial = join(dir, "trial.drawio");
+    writeFileSync(trial, FIXTURE.replace("rounded=0;whiteSpace=wrap;html=1;align=left;spacingLeft=20;", "rounded=1;html=1;fillColor=#ffeeee;"));
+    const paletteConfig = join(dir, "palette-config.json");
+    writeFileSync(paletteConfig, JSON.stringify({ lint: { palette: "fixture.drawio" } }));
+    const against = invoke(["lint", trial, "--config", paletteConfig]);
+    assert.match(against.stderr, /appears nowhere in the palette/, "the config's palette flags the restyled cell");
+    const own = invoke(["lint", trial, "--config", paletteConfig, "--palette", trial]);
+    assert.ok(!own.stderr.includes("appears nowhere in the palette"), `--palette must override the config's palette:\n${own.stderr}`);
+    passed += 1;
+    console.log("ok  lint: --palette overrides the config's palette");
+    failsLoudly("lint: --palette requires a path", ["lint", trial, "--palette"], "--palette requires a path");
+    failsLoudly("lint: --palette names a missing file", ["lint", trial, "--palette", join(dir, "nowhere.drawio")], "which does not exist");
+  }
+
+  { // diff-cells --subset: a true subset passes, a re-authored or extra cell fails.
+    const library = join(dir, "library.drawio");
+    writeFileSync(library, FIXTURE);
+    const subset = join(dir, "subset.drawio");
+    writeFileSync(subset, FIXTURE.replace(/<mxCell id="other"[\s\S]*?<\/mxCell>\s*<mxCell id="e"[\s\S]*?<\/mxCell>\s*<mxCell id="el"[\s\S]*?<\/mxCell>/, ""));
+    const pass = succeeds("diff-cells: --subset passes a true subset", ["diff-cells", subset, library, "--subset"]);
+    assert.match(pass.stdout, /subset: 2 of 2 shared cell\(s\) match the source, 0 cell\(s\) only in the copy, 0 violation\(s\)/);
+    const reauthored = join(dir, "reauthored.drawio");
+    writeFileSync(reauthored, readFileSync(subset, "utf8").replace('value="MEASURED"', 'value="EDITED"'));
+    const edited = invoke(["diff-cells", reauthored, library, "--subset"]);
+    assert.equal(edited.status, 1, "a re-authored cell fails the proof");
+    assert.match(edited.stdout, /cell padded: value differs/);
+    const extra = join(dir, "extra.drawio");
+    writeFileSync(extra, readFileSync(subset, "utf8").replace("</root>", '<mxCell id="stray" value="x" style="text;" vertex="1" parent="1"><mxGeometry x="1" y="1" width="10" height="10" as="geometry"/></mxCell></root>'));
+    const added = invoke(["diff-cells", extra, library, "--subset"]);
+    assert.equal(added.status, 1, "an extra cell fails the proof");
+    assert.match(added.stdout, /cell stray: only in the copy/);
+    passed += 1;
+    console.log("ok  diff-cells: --subset convicts a re-authored and an extra cell");
+  }
+
+  { // seat-label: the label lands on the chosen segment's midpoint with a
+    // centring offset, and lint's seating check accepts it.
+    const seatSource = join(dir, "seat.drawio");
+    writeFileSync(seatSource, `<mxfile><diagram name="s" id="s1"><mxGraphModel><root>
+      <mxCell id="0" /><mxCell id="1" parent="0" />
+      <mxCell id="a" value="A" style="rounded=0;html=1;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="100" height="40" as="geometry" /></mxCell>
+      <mxCell id="b" value="B" style="rounded=0;html=1;" vertex="1" parent="1"><mxGeometry x="500" y="300" width="100" height="40" as="geometry" /></mxCell>
+      <mxCell id="e" style="html=1;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="a" target="b"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="300" y="20" /><mxPoint x="300" y="320" /></Array></mxGeometry></mxCell>
+      <mxCell id="el" value="&lt;b&gt;MPC:&lt;/b&gt;&lt;br&gt;Reads the ledger" style="edgeLabel;html=1;align=left;verticalAlign=middle;" vertex="1" connectable="0" parent="e"><mxGeometry x="0.9" relative="1" as="geometry"><mxPoint x="40" y="40" as="offset" /></mxGeometry></mxCell>
+    </root></mxGraphModel></diagram></mxfile>`);
+    const before = invoke(["lint", seatSource, "--no-config"]);
+    assert.match(before.stderr, /label el .* on edge e: its own/, "the unseated label fails seating");
+    const seated = succeeds("seat-label: seats on the first (horizontal) segment", ["seat-label", seatSource, "el", "--segment", "1"]);
+    // Segments run 200, 300 and 200 units, so segment 1's midpoint sits 100 of
+    // 700 units along the arc: fraction 1/7, position 2/7 - 1.
+    assert.match(seated.stderr, /seated el on segment 1 of 3 of edge e: position -0\.7143/, "segment 1's midpoint is one seventh of the arc");
+    const text = readFileSync(seatSource, "utf8");
+    assert.match(text, /id="el"[^>]*>\s*<mxGeometry x="-0\.7143" relative="1"/, "the relative position is written");
+    assert.match(text, /<mxPoint x="-\d+" y="0" as="offset" \/>/, "align=left gets minus half the estimated width and no vertical offset");
+    const after = invoke(["lint", seatSource, "--no-config"]);
+    assert.ok(!/label el .* on edge e: its own/.test(after.stderr), `the seated label passes seating:\n${after.stderr}`);
+    succeeds("seat-label: seats on the vertical segment", ["seat-label", seatSource, "el", "--segment", "2"]);
+    failsLoudly("seat-label: refuses a segment out of range", ["seat-label", seatSource, "el", "--segment", "4"], "out of range");
+    failsLoudly("seat-label: refuses a non-label", ["seat-label", seatSource, "a", "--segment", "1"], "is not an edge label");
+    failsLoudly("seat-label: requires --segment", ["seat-label", seatSource, "el"], "--segment");
   }
 
   console.log(`argument parsing tests passed (${passed} checks)`);

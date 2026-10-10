@@ -123,6 +123,12 @@ Scale is the resolution lever: pixel dimensions grow linearly with it and file s
 roughly with its square. Raise it when a diagram looks soft, lower it when files
 get heavy.
 
+The exporter clamps the long side of a PNG to its 16384 pixel canvas limit and says
+nothing, so `render` predicts the export's size from the model bounds first and refuses
+a model that would be clamped, naming the predicted size and the largest `render.scale`
+that fits. A PNG that comes back sitting on the limit is refused the same way, and
+`check-pair` reads such a sibling as clamped rather than fresh.
+
 Rendering opens the diagram's markup in a headless browser, so every request the page
 makes is intercepted and aborted unless it addresses the render's own localhost server.
 A diagram that reaches for a remote resource (an `html=1` label embedding a remote image,
@@ -177,6 +183,72 @@ A `.drawio` saved by the desktop app stores each page deflated rather than as XM
 `lint` expands such a page before checking it, so a compressed file is linted on its real
 model instead of passing green with nothing inspected. The same holds for the `cells`
 table and `styles`.
+
+A `.drawio` whose bytes are an SVG or PNG export (a render saved under the source's
+name) is refused by `lint`, `cells`, `styles` and the editing verbs, naming the real
+format and the fix: such a file holds no stored XML, and a reader that inspected it as
+source would find zero cells and pass. `extract` still recovers its embedded model.
+
+`lint` takes several inputs, printing a `== <file>` header and a summary per file and
+aggregating the exit code, so one invocation gates a whole repository.
+
+The nearest `drawio.config.json` above each input supplies the repository's vocabulary
+through its `lint` section, announced on stderr as `config: <path>` when found:
+
+```json
+{
+  "lint": {
+    "labelFormat": "strict",
+    "verbs": ["Reads", "Posts"],
+    "subjects": ["MPC", "dApp/relayer"],
+    "palette": "docs/diagram-palette.drawio"
+  }
+}
+```
+
+`labelFormat` is `strict` (the default) or `off`, which skips the format check and
+says so in a note. `verbs` and `subjects` are lists a well-formed label's body verb
+and first line must come from (error tier). `codeLabels` is `call` (the default: a
+whole-text call expression is exempt from the format check) or `identifier` (a bare
+identifier or type name is exempt too). `palette` names the copy-source card,
+relative to the config file: every styled cell's style family (its style with
+placement and routing tokens stripped, image payloads elided, tokens sorted) must
+appear on the card, or the cell warns as hand-styled. A list that is absent is not
+checked, and a configured check that reaches no cell says so as vacuous.
+
+One repository often holds diagrams of different kinds, so `lint.files` carries
+per-file vocabulary: a list of entries whose `match` is a glob relative to the config
+file (`*` one segment, `**` any depth), each able to set `labelFormat`, `verbs`,
+`subjects` and `codeLabels`. The first matching entry overrides the top-level values
+for that diagram, and lint announces which entry applied:
+
+```json
+{
+  "lint": {
+    "verbs": ["Stores", "Records"],
+    "files": [
+      { "match": "docs/*-state-machine.drawio", "subjects": ["recordProof", "expireTransaction"] },
+      { "match": "docs/*-flow.drawio", "codeLabels": "identifier", "labelFormat": "off" }
+    ]
+  }
+}
+```
+
+`--config <path>` applies one file in place of the upward search, `--no-config` runs
+the universal checks alone, and `--palette <path>` checks style families against
+that file for one run (the config's `palette` path resolves against the config file,
+so a trial copy elsewhere needs this to be checked against itself). The rules
+themselves are the [style guide](docs/style-guide.md).
+
+Three more checks guard geometry the webapp never recomputes. A `stackLayout`
+container whose rows are not contiguous from its `startSize`, or whose height is not
+its last row's bottom plus `marginBottom`, warns naming the row (warning tier). A
+crossing of two different-colour edges where neither carries `jumpStyle` warns, since
+the crossing reads as a junction, and the hop renders on whichever of the two edges
+the file declares later. And three advisory notes: a line estimated wider than its
+box when the box has no room for another line (a wrapped last line hides under
+`overflow=hidden`), a coloured edge carrying no label, and content past the
+1300 by 800 unit working-size budget.
 
 ### cells
 
@@ -234,21 +306,59 @@ render, measure and adjust loop. A fit id is measured whether or not `--cell` al
 and an edge label, which declares no box of its own, says there is nothing to fit.
 
 `--affine` prints the mapping from model units to PNG pixels that this same calibration
-implies, per axis and in both directions, so cropping a model region out of the render is a
-substitution rather than a transcription of the calibration line. It stands on its own: with
-no cell named it prints the mapping and measures nothing.
+implies, per axis and in both directions. It stands on its own: with no cell named it
+prints the mapping and measures nothing. `crop` applies the mapping for you.
+
+### crop
+
+Crops a region of a rendered PNG given in model units, mapped to pixels through the same
+calibration `measure` uses, and writes the crop beside the input (or at `-o`). The one
+refusal is a calibration residual larger than the region itself, which could put the crop
+off its target entirely. A smaller residual is named on stderr as the crop's error bar.
+
+```
+node src/cli.js crop diagram.drawio.png --region 40,1200,196,284
+```
+
+### fit-box
+
+Sizes a box to its rendered text under the uniform padding rule: it reads the fresh
+rendered sibling, computes the box `measure --fit` reports for the cell, and writes that
+width and height into the source with the geometry editor. A missing or stale sibling is
+refused, since the ink is measured on it. Re-render the pair afterwards.
+
+```
+node src/cli.js fit-box diagram.drawio some-node
+```
+
+### seat-label
+
+Seats an edge label on the midpoint of one pinned segment of its edge, in place. A
+label's geometry `x` is its position along the edge's arc length mapped to -1..1, and
+its offset point shifts the anchor. `align=left` hangs the text to the right of the
+anchor and `align=right` to the left, so the verb writes minus or plus half the
+estimated text width as the offset (`align=center` gets none), and a label without
+`verticalAlign=middle` gets the vertical shift that centres it. After seating, re-render
+and lint: the seating check accepts a label whose run passes through its centre.
+
+```
+node src/cli.js seat-label diagram.drawio some-label --segment 2
+```
 
 ```
 node src/cli.js measure diagram.drawio.png --fit some-node --affine
 ```
 
-The residual quiets down when it has nothing left to teach. A residual no wider than the
-render border's own pixel slack (the export already leaves that much room on every side) and
-attributed to named edge-label overhangs demotes to a one-line note. A residual past that
-width, or one whose only suspects are the cells that set the bounds, which is a guess rather
-than an attribution, stays a `WARNING`. `--quiet-calibration` drops the calibration line and
-that note entirely, and never the warning: the warning is the error bar on every number
-printed under it.
+The residual quiets down when it has nothing left to teach. The predicted bounds fold in
+the estimated boxes of edge labels and of captions rendered above or below image cells,
+the two things the export frames beyond the geometry. A residual no wider than the
+render border's own pixel slack and sitting on an axis whose bound is an edge (the webapp
+pads an edge's bounds) or an estimated box demotes to a one-line note naming the cell. A
+residual past that width, or one whose bounds are plain shapes, stays a `WARNING`.
+`--quiet-calibration` drops the calibration line and that note entirely, and never the
+warning: the warning is the error bar on every number printed under it. Under a live
+warning `--affine` still prints the mapping, with the residual named as the error bar
+a pixel read through it may carry.
 
 ### styles
 
@@ -287,6 +397,45 @@ run. With no `--allow` at all it is a strict nothing-may-change check.
 drawio-cli guard-diff baseline.drawio edited.drawio --allow box-a --allow wire-3
 ```
 
+### check-pair
+
+Verifies that each `.drawio`'s rendered `.drawio.png` sibling still carries the
+source's model: every cell's value, style, parent, geometry, waypoints and label offset
+match, and no cell exists on one side only. Values are compared decoded to a fixpoint,
+since the webapp re-spells entities (an apostrophe comes back as `&#39;`) without
+changing what renders, and geometry is rounded to a thousandth with a missing
+coordinate reading as zero. A stale or missing sibling exits 1 naming the cells that
+differ.
+
+```
+node src/cli.js check-pair docs/architecture.drawio
+```
+
+### check-project
+
+Verifies a directory tree follows the diagram project layout the style guide defines:
+a `drawio.config.json` at or above it that parses, a `docs/diagramming.md` beside that
+config, a `lint.palette` that exists and lints with no errors, and for every `.drawio`
+under the tree a lint under the vocabulary its path gets (failing on errors, counts
+shown) and a rendered sibling that `check-pair` accepts, clamped siblings included.
+One line per assertion, `ok` or `FAIL`, exit 1 on any failure.
+
+```
+node src/cli.js check-project docs
+```
+
+### diff-cells --subset
+
+The copy proof: `diff-cells <copy> <source> --subset` holds that every cell of the copy
+was copied from the source unchanged in value and style. Ids only in the source are
+expected (a copy keeps a subset), ids only in the copy and shared ids that differ are
+violations, and the exit code follows them. A flow diagram copied from a library or an
+actor map proves its membership this way.
+
+```
+node src/cli.js diff-cells docs/deposit-flow.drawio docs/diagram-library.drawio --subset
+```
+
 ### doctor
 
 Checks the render path: the extension webapp, the playwright package and its Chromium
@@ -301,14 +450,41 @@ Playwright is loaded only when a render actually starts, so every other verb (`e
 checkout that has never installed it. Without it `doctor` names the missing package and
 `render` fails with the same fix.
 
+## Style guide and project layout
+
+Every rule a diagram follows, with the verb and tier that enforces each mechanical one,
+is the [style guide](docs/style-guide.md). Its "Project layout" section names the
+files a consuming repository commits: a root `drawio.config.json` with the `lint`
+section above, a `docs/diagramming.md` holding only that project's vocabulary, a
+palette card named by `lint.palette`, an icon bank, and a rendered sibling beside
+every source. `check-project` verifies the layout.
+
+A new project starts its palette from the base card at
+[templates/diagram-palette.drawio](templates/diagram-palette.drawio), rendered as
+[templates/diagram-palette.drawio.png](templates/diagram-palette.drawio.png). It
+carries the generic constructions (edge swatches, the strict-format edge label seated
+on a horizontal and on a vertical run, the actor box with its embedded icon, the node
+box, the note, the step circle, the lane header unit, the actor cluster and the code
+cell) with no project colours or icons. From the consuming repository's root, with
+`<repo-root>` the absolute path of this checkout:
+
+```
+mkdir -p docs
+cp <repo-root>/templates/diagram-palette.drawio docs/diagram-palette.drawio
+```
+
+Then extend the copy with the project's own entries and render it.
+
 ## Test
 
 ```
 npm test
 ```
 
-Checks asset selection, installation, lint, arguments, hooks, icon gaps, curation and
-rendering. The lint-violations suite (`test/lint-violations.mjs`)
+Checks asset selection, installation, lint, arguments, hooks, icon gaps, curation,
+pair and project checks, calibration and the measuring verbs, and rendering. The
+project and measure suites (`test/project.mjs`, `test/measure.mjs`) build synthetic
+rendered pairs, so they need no browser. The lint-violations suite (`test/lint-violations.mjs`)
 plants a violation for every lint check and asserts it fires, with a clean control beside
 it that must stay quiet. The argument-parsing suite (`test/args.mjs`) covers every verb's
 flags, positionals and refusals, and re-runs the static verbs with playwright made

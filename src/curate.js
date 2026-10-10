@@ -55,10 +55,14 @@ export function setCurated(xml, on) {
 }
 
 const round = (n) => Math.round(Number(n ?? 0) * 1000) / 1000;
-const geoKey = (c) =>
+
+/** A cell's geometry as one comparable string, rounded to a thousandth, a missing coordinate reading as zero. */
+export const geoKey = (c) =>
   c.geo ? ["x", "y", "width", "height", "relative"].map((k) => round(c.geo[k])).join(",") : "none";
-const pointsKey = (c) => (c.points ?? []).map((p) => `${round(p.x)},${round(p.y)}`).join(" ") || "none";
-const offsetKey = (c) => (c.offset ? `${round(c.offset.x)},${round(c.offset.y)}` : "none");
+/** A cell's waypoints as one comparable string. */
+export const pointsKey = (c) => (c.points ?? []).map((p) => `${round(p.x)},${round(p.y)}`).join(" ") || "none";
+/** A label's offset point as one comparable string. */
+export const offsetKey = (c) => (c.offset ? `${round(c.offset.x)},${round(c.offset.y)}` : "none");
 
 /**
  * Compares two models cell-for-cell and reports every id whose value, style,

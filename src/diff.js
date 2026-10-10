@@ -21,6 +21,35 @@ export function diffCells(xmlA, xmlB) {
   const onlyB = [...b.keys()].filter((id) => !a.has(id) && id !== "0" && id !== "1");
   if (onlyA.length > 0) lines.push(`only in A (${onlyA.length}): ${onlyA.join(", ")}`);
   if (onlyB.length > 0) lines.push(`only in B (${onlyB.length}): ${onlyB.join(", ")}`);
+  lines.push(...sharedDifferences(a, b));
+  return lines;
+}
+
+/**
+ * The copy proof: whether every cell of `copyXml` was copied from
+ * `sourceXml` unchanged in value and style. Ids only in the source are
+ * expected (a copy keeps a subset), ids only in the copy and shared ids that
+ * differ are violations. Geometry is excluded, as in {@link diffCells}.
+ *
+ * @returns lines - The report, and violations - the count that fails the proof.
+ */
+export function subsetCells(copyXml, sourceXml) {
+  const copy = parseCells(copyXml);
+  const source = parseCells(sourceXml);
+  const lines = [];
+  const extra = [...copy.keys()].filter((id) => !source.has(id) && id !== "0" && id !== "1");
+  const shared = [...copy.keys()].filter((id) => source.has(id) && id !== "0" && id !== "1");
+  const differing = sharedDifferences(copy, source);
+  for (const id of extra) lines.push(`cell ${id}: only in the copy, not copied from the source`);
+  lines.push(...differing);
+  const violations = extra.length + differing.length;
+  lines.push(`subset: ${shared.length - differing.length} of ${shared.length} shared cell(s) match the source, ${extra.length} cell(s) only in the copy, ${violations} violation(s)`);
+  return { lines, violations };
+}
+
+/** The value and style differences of the ids both maps hold. */
+function sharedDifferences(a, b) {
+  const lines = [];
   for (const [id, ca] of a) {
     const cb = b.get(id);
     if (!cb || id === "0" || id === "1") continue;

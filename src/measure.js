@@ -76,62 +76,110 @@ function strokeRgb(style) {
 }
 
 /**
- * Measures cells of a rendered .drawio.png against its embedded model.
- * Calibration maps model units to pixels from the FULL content bounds
- * (geometry plus estimated edge-label boxes, labels being the usual reason
- * the export outgrows the geometry) plus the render config's scale and
- * border; the report opens with the calibration residual so measurements
- * carry their own error bar.
- *
- * @param pngBuffer - The rendered PNG's bytes.
- * @param xml - The model embedded in that PNG.
- * @param cellIds - Ids to measure, in report order.
- * @param fitIds - Ids that additionally report the box their measured text ink
- *   implies under the uniform padding rule. Every fit id is measured, so the
- *   caller need not repeat it in `cellIds`.
- * @param gapIds - Container ids whose children's clearances and largest empty
- *   rectangle are reported.
- * @param affine - When true, print the model-unit to pixel mapping per axis in
- *   both directions, taken from this same calibration. Refused while a live
- *   calibration WARNING stands: numbers with an unexplained shift mislead.
- * @param iconGaps - When true, sweep every labelled vertex that geometrically
- *   contains an image cell (an icon embedded in an actor box) and report the
- *   clear gap between the icon's rendered ink and the first text glyph, in
- *   model units. A pair under `minIconGap` is flagged with
- *   {@link ICON_GAP_FLAG}; a model with no such pairs reports the sweep as
- *   vacuous rather than green.
- * @param minIconGap - Minimum acceptable icon-ink-to-glyph gap in model units
- *   for the `iconGaps` sweep.
- * @param scale - Render scale the PNG was exported at.
- * @param border - Render border, in model units, the PNG was exported with.
- * @param quietCalibration - When true, drop the calibration line and a demoted
- *   residual note. A residual too large or too vague to attribute still warns:
- *   it is the error bar on every number below it.
- * @returns The report, one cell per line.
- * @throws When the PNG's size is so far off the prediction that it must have
- *   been rendered at a different scale: numbers would be nonsense.
+ * The estimated boxes of captions the exporter draws outside their cells: an
+ * image cell's value with `verticalLabelPosition` top or bottom renders above
+ * or below the image, centred, and extends the export bounds past the geometry.
  */
-export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], affine = false, scale, border, quietCalibration = false, iconGaps = false, minIconGap = 8 }) {
-  const img = decodePng(pngBuffer);
-  const cells = parseCells(xml);
+function captionBoxes(cells) {
+  const out = [];
+  for (const c of cells.values()) {
+    if (c.attrs.vertex !== "1" || !c.geo || !c.attrs.value) continue;
+    const position = c.style.verticalLabelPosition;
+    if (position !== "top" && position !== "bottom") continue;
+    if (cells.get(c.attrs.parent)?.attrs.edge === "1") continue;
+    const box = bbox(cells, c);
+    const est = estimateLabelBox(c.attrs.value);
+    // A caption carries the webapp's label padding on each side, which the
+    // bare text estimate does not include.
+    const w = est.w + 2 * CAPTION_PAD;
+    const x = box.x + box.w / 2 - w / 2;
+    const y = position === "top" ? box.y - est.h - CAPTION_GAP : box.y + box.h + CAPTION_GAP;
+    out.push({ cell: c, box: { x, y, w, h: est.h } });
+  }
+  return out;
+}
+
+// units: the clearance the webapp leaves between an image and its caption, and the label padding each side of the caption text.
+const CAPTION_GAP = 2;
+const CAPTION_PAD = 4;
+// units: the export slack per axis from strokes straddling their geometry, a
+// two-unit stroke's half on each bound.
+const STROKE_SLACK = 2;
+
+/**
+ * The content bounds the exporter frames: geometry, plus the estimated boxes
+ * of edge labels and of image captions, both of which the export includes
+ * although neither has committed geometry. `overhangs` names each estimated
+ * box that reaches past the geometry, which is what a residual is usually
+ * made of.
+ */
+export function fullBounds(cells) {
   const b = modelBounds(cells);
   const labels = estimatedLabelBoxes(cells);
-  // Labels have no committed geometry yet extend the export bounds, so the
-  // calibration includes their estimated boxes: that is what makes the offset
-  // true when a label hangs past the outermost shape.
-  let fullMinX = b.minX, fullMinY = b.minY, fullMaxX = b.maxX, fullMaxY = b.maxY;
+  const captions = captionBoxes(cells);
+  let minX = b.minX, minY = b.minY, maxX = b.maxX, maxY = b.maxY;
   const overhangs = [];
-  for (const l of labels) {
-    const over = Math.max(
-      b.minX - l.box.x, (l.box.x + l.box.w) - b.maxX,
-      b.minY - l.box.y, (l.box.y + l.box.h) - b.maxY,
-    );
-    if (over > 2) overhangs.push(`${l.cell.id} (~${Math.round(over)}u past the geometry bounds)`);
-    fullMinX = Math.min(fullMinX, l.box.x);
-    fullMinY = Math.min(fullMinY, l.box.y);
-    fullMaxX = Math.max(fullMaxX, l.box.x + l.box.w);
-    fullMaxY = Math.max(fullMaxY, l.box.y + l.box.h);
+  for (const { cell, box } of [...labels, ...captions]) {
+    const over = Math.max(b.minX - box.x, (box.x + box.w) - b.maxX, b.minY - box.y, (box.y + box.h) - b.maxY);
+    if (over > 2) overhangs.push(`${cell.id} (~${Math.round(over)}u past the geometry bounds)`);
+    minX = Math.min(minX, box.x);
+    minY = Math.min(minY, box.y);
+    maxX = Math.max(maxX, box.x + box.w);
+    maxY = Math.max(maxY, box.y + box.h);
   }
+  // Which estimated box, if any, sets each full bound: a residual on an axis
+  // whose bound is an estimate is the estimate's error, attributed rather
+  // than unexplained.
+  const estimated = { minX: null, minY: null, maxX: null, maxY: null };
+  for (const { cell, box } of [...labels, ...captions]) {
+    if (box.x <= b.minX - 0.01 && box.x <= minX + 0.01) estimated.minX = cell.id;
+    if (box.y <= b.minY - 0.01 && box.y <= minY + 0.01) estimated.minY = cell.id;
+    if (box.x + box.w >= b.maxX + 0.01 && box.x + box.w >= maxX - 0.01) estimated.maxX = cell.id;
+    if (box.y + box.h >= b.maxY + 0.01 && box.y + box.h >= maxY - 0.01) estimated.maxY = cell.id;
+  }
+  return { minX, minY, maxX, maxY, setBy: b.setBy, estimated, overhangs, labels };
+}
+
+/** The longest side a PNG export can have: the browser canvas limit the exporter silently clamps to. */
+export const EXPORT_CANVAS_LIMIT = 16384;
+
+/**
+ * The pixel size an export of this model has at `scale` and `border`, and
+ * the largest scale that keeps it inside the canvas limit. A model whose
+ * prediction exceeds the limit is clamped by the exporter without a word,
+ * so the caller refuses before rendering, or reads a clamped sibling as stale.
+ */
+export function predictedExportSize(xml, { scale, border }) {
+  let bounds;
+  try {
+    bounds = fullBounds(parseCells(xml));
+  } catch {
+    // A model with no geometry has no export size, so nothing to clamp.
+    return { width: 0, height: 0, clamped: false, fittingScale: scale };
+  }
+  const w = bounds.maxX - bounds.minX, h = bounds.maxY - bounds.minY;
+  const width = Math.round((w + 2 * border) * scale);
+  const height = Math.round((h + 2 * border) * scale);
+  const fittingScale = Math.floor((EXPORT_CANVAS_LIMIT / Math.max(w, h) - 0) * 100) / 100;
+  return { width, height, clamped: width > EXPORT_CANVAS_LIMIT || height > EXPORT_CANVAS_LIMIT, fittingScale: Math.max(0.1, Math.min(fittingScale, scale)) };
+}
+
+/**
+ * Maps the model embedded in a rendered PNG onto that PNG's pixels. The
+ * residual between the predicted and actual size is the error bar on every
+ * number read through the mapping: within the render border's slack it is a
+ * note, beyond it a WARNING that stays attached to the numbers.
+ *
+ * @returns The decoded image, the parsed cells, the full bounds, the
+ *   prediction and residual, the calibration report lines, `warningLive`,
+ *   `toPx` (model point to pixel) and `u` (pixels to rounded model units).
+ * @throws When the PNG's size says it was rendered at a different scale.
+ */
+export function calibrate(pngBuffer, xml, { scale, border, quietCalibration = false }) {
+  const img = decodePng(pngBuffer);
+  const cells = parseCells(xml);
+  const bounds = fullBounds(cells);
+  const { minX: fullMinX, minY: fullMinY, maxX: fullMaxX, maxY: fullMaxY, overhangs, labels } = bounds;
   const predictedW = Math.round((fullMaxX - fullMinX + 2 * border) * scale);
   const predictedH = Math.round((fullMaxY - fullMinY + 2 * border) * scale);
   const residualW = img.width - predictedW;
@@ -153,16 +201,20 @@ export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], aff
   }
   const lines = [];
   if (!quietCalibration) {
-    const labelNote = overhangs.length > 0 ? ` (label boxes extend the geometry: ${overhangs.join(", ")})` : "";
+    const labelNote = overhangs.length > 0 ? ` (estimated boxes extend the geometry: ${overhangs.join(", ")})` : "";
     lines.push(
       `calibration: scale=${scale} border=${border} content=(${Math.round(fullMinX)},${Math.round(fullMinY)})..(${Math.round(fullMaxX)},${Math.round(fullMaxY)})${labelNote} ` +
         `png=${img.width}x${img.height} predicted=${predictedW}x${predictedH} residual=${residualW},${residualH}px`,
     );
   }
+  // A stroke straddles its geometry by half its width, so a 2-unit stroke on
+  // each bound of an axis adds two units to the export, and the predicted size
+  // rounds to a pixel: that much is slack.
+  const slack = STROKE_SLACK * scale + 1;
   let warningLive = false;
-  if (Math.abs(residualW) > 2 * scale || Math.abs(residualH) > 2 * scale) {
-    const suspects = `Bounds are set by left=${b.setBy.minX} top=${b.setBy.minY} right=${b.setBy.maxX} ` +
-      `bottom=${b.setBy.maxY}: check those cells for overhanging strokes`;
+  if (Math.abs(residualW) > slack || Math.abs(residualH) > slack) {
+    const suspects = `Bounds are set by left=${bounds.setBy.minX} top=${bounds.setBy.minY} right=${bounds.setBy.maxX} ` +
+      `bottom=${bounds.setBy.maxY}: check those cells for overhanging strokes`;
     // The export leaves `border` units of slack per side, so a residual within
     // it pushes nothing out of frame. When the bound-setting cells on the
     // offending axes are EDGES, the webapp's habit of padding an edge's
@@ -170,22 +222,36 @@ export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], aff
     // harmless is a note, not a warning repeated on every invocation.
     const small = Math.max(Math.abs(residualW), Math.abs(residualH)) <= border * scale;
     const isEdge = (id) => cells.get(id)?.attrs.edge === "1";
-    const edgesExplain =
-      (Math.abs(residualW) <= 2 * scale || isEdge(b.setBy.minX) || isEdge(b.setBy.maxX)) &&
-      (Math.abs(residualH) <= 2 * scale || isEdge(b.setBy.minY) || isEdge(b.setBy.maxY));
-    if (small && edgesExplain) {
+    // An axis whose bound is an edge (the webapp pads an edge's bounds beyond
+    // its polyline) or an estimated label or caption box (a character-count
+    // estimate, about a tenth out) has its residual explained.
+    const explained = (axisResidual, setBy, estimatedBy) =>
+      Math.abs(axisResidual) <= slack || isEdge(setBy) || estimatedBy !== null;
+    // A residual on an axis comes from one of its two bounds, so either bound
+    // being an edge or an estimate explains that axis.
+    const attributed =
+      (explained(residualW, bounds.setBy.minX, bounds.estimated.minX) || explained(residualW, bounds.setBy.maxX, bounds.estimated.maxX)) &&
+      (explained(residualH, bounds.setBy.minY, bounds.estimated.minY) || explained(residualH, bounds.setBy.maxY, bounds.estimated.maxY));
+    // One shift on both axes is what a misstated border produces, which an
+    // estimate cannot explain, so it stays a warning unless an edge sets a
+    // bound: the webapp pads an edge's bounds evenly, which shifts both axes too.
+    const anyEdgeBound = [bounds.setBy.minX, bounds.setBy.maxX, bounds.setBy.minY, bounds.setBy.maxY].some(isEdge);
+    const uniformShift = residualW === residualH && Math.abs(residualW) > slack && !anyEdgeBound;
+    if (small && attributed && !uniformShift) {
       if (!quietCalibration) {
+        const estimates = Object.values(bounds.estimated).filter((id) => id !== null);
         lines.push(
           `calibration: note residual ${residualW},${residualH}px is within the render border ` +
-            `(${border}u = ${border * scale}px) and attributed to bound-setting edges ` +
-            `(the webapp pads an edge's bounds beyond its declared polyline). ${suspects}`,
+            `(${border}u = ${border * scale}px) and attributed to bound-setting edges or estimated boxes` +
+            `${estimates.length > 0 ? ` (${[...new Set(estimates)].join(", ")})` : ""}. ${suspects}`,
         );
       }
     } else {
       warningLive = true;
       lines.push(
-        `calibration: WARNING residual exceeds ${2 * scale}px, strokes extend past the estimated ` +
-          `content bounds; per-cell numbers below may be off by up to residual/scale units. ${suspects}`,
+        `calibration: WARNING residual exceeds ${slack}px, strokes extend past the estimated ` +
+          `content bounds; per-cell numbers below may be off by up to residual/scale units. ` +
+          `${uniformShift ? "The same shift on both axes is what a misstated border produces: check --border against the render. " : ""}${suspects}`,
       );
     }
   }
@@ -196,26 +262,76 @@ export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], aff
     y: Math.round((my - fullMinY + border) * scale) + shiftY,
   });
   const u = (px) => Math.round((px / scale) * 10) / 10;
+  return {
+    img, cells, bounds, labels, scale, border,
+    predictedW, predictedH, residualW, residualH, shiftX, shiftY, warningLive, lines, toPx, u,
+  };
+}
+
+/**
+ * Measures cells of a rendered .drawio.png against its embedded model.
+ * Calibration maps model units to pixels from the FULL content bounds
+ * (geometry plus estimated edge-label boxes, labels being the usual reason
+ * the export outgrows the geometry) plus the render config's scale and
+ * border; the report opens with the calibration residual so measurements
+ * carry their own error bar.
+ *
+ * @param pngBuffer - The rendered PNG's bytes.
+ * @param xml - The model embedded in that PNG.
+ * @param cellIds - Ids to measure, in report order.
+ * @param fitIds - Ids that additionally report the box their measured text ink
+ *   implies under the uniform padding rule. Every fit id is measured, so the
+ *   caller need not repeat it in `cellIds`.
+ * @param gapIds - Container ids whose children's clearances and largest empty
+ *   rectangle are reported.
+ * @param affine - When true, print the model-unit to pixel mapping per axis in
+ *   both directions, taken from this same calibration, with the residual named
+ *   as its error bar while a calibration WARNING stands.
+ * @param collect - When an object with a `fits` array, every `--fit` verdict
+ *   is also pushed there as `{ id, impliedW, impliedH }`, so a caller can apply
+ *   the fit without parsing the report.
+ * @param iconGaps - When true, sweep every labelled vertex that geometrically
+ *   contains an image cell (an icon embedded in an actor box) and report the
+ *   clear gap between the icon's rendered ink and the first text glyph, in
+ *   model units. A pair under `minIconGap` is flagged with
+ *   {@link ICON_GAP_FLAG}; a model with no such pairs reports the sweep as
+ *   vacuous rather than green.
+ * @param minIconGap - Minimum acceptable icon-ink-to-glyph gap in model units
+ *   for the `iconGaps` sweep.
+ * @param scale - Render scale the PNG was exported at.
+ * @param border - Render border, in model units, the PNG was exported with.
+ * @param quietCalibration - When true, drop the calibration line and a demoted
+ *   residual note. A residual too large or too vague to attribute still warns:
+ *   it is the error bar on every number below it.
+ * @returns The report, one cell per line.
+ * @throws When the PNG's size is so far off the prediction that it must have
+ *   been rendered at a different scale: numbers would be nonsense.
+ */
+export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], affine = false, scale, border, quietCalibration = false, iconGaps = false, minIconGap = 8, collect = null }) {
+  const cal = calibrate(pngBuffer, xml, { scale, border, quietCalibration });
+  const { img, cells, labels, residualW, residualH, shiftX, shiftY, warningLive, toPx, u } = cal;
+  const { minX: fullMinX, minY: fullMinY } = cal.bounds;
+  const lines = [...cal.lines];
   if (affine) {
+    // The same numbers toPx runs on, written out so a crop of a model region
+    // is one substitution rather than a transcription of the calibration line.
+    // Under a live warning the residual is the error bar, stated with the mapping.
+    const offsetX = border * scale + shiftX;
+    const offsetY = border * scale + shiftY;
     if (warningLive) {
       lines.push(
-        "affine: refused while a live calibration WARNING stands, its unexplained shift would be " +
-          "baked into the offset. Attribute or fix the residual first.",
-      );
-    } else {
-      // The same numbers toPx runs on, written out so a crop of a model region
-      // is one substitution rather than a transcription of the calibration line.
-      const offsetX = border * scale + shiftX;
-      const offsetY = border * scale + shiftY;
-      lines.push(
-        `affine: offset = border ${border}u * scale ${scale} + residual shift ${shiftX},${shiftY}px ` +
-          `(= ${offsetX},${offsetY}px); px rounds to the nearest integer`,
-        `affine x: px = ${shifted("mx", fullMinX)} * ${scale} + ${offsetX}`,
-        `affine x: mx = (px - ${offsetX}) / ${scale} ${added(fullMinX)}`,
-        `affine y: py = ${shifted("my", fullMinY)} * ${scale} + ${offsetY}`,
-        `affine y: my = (py - ${offsetY}) / ${scale} ${added(fullMinY)}`,
+        `affine: error bar ${Math.abs(residualW)},${Math.abs(residualH)}px (the live calibration WARNING above): ` +
+          `a pixel read through this mapping may be off by up to that much on its axis`,
       );
     }
+    lines.push(
+      `affine: offset = border ${border}u * scale ${scale} + residual shift ${shiftX},${shiftY}px ` +
+        `(= ${offsetX},${offsetY}px); px rounds to the nearest integer`,
+      `affine x: px = ${shifted("mx", fullMinX)} * ${scale} + ${offsetX}`,
+      `affine x: mx = (px - ${offsetX}) / ${scale} ${added(fullMinX)}`,
+      `affine y: py = ${shifted("my", fullMinY)} * ${scale} + ${offsetY}`,
+      `affine y: my = (py - ${offsetY}) / ${scale} ${added(fullMinY)}`,
+    );
   }
   // Scans ink inside a model-space box, inset by insetU units per side so a
   // border stroke never counts as ink. Returns null when no ink is found.
@@ -274,6 +390,7 @@ export function measure(pngBuffer, xml, { cellIds, fitIds = [], gapIds = [], aff
     if (!ink) return `  fit ${id}: no text ink found inside the border, nothing to size the box to`;
     const impliedW = round1(ink.w + 2 * FIT_PAD_X);
     const impliedH = round1(ink.h + 2 * FIT_PAD_Y);
+    if (collect !== null) collect.fits.push({ id, impliedW, impliedH });
     const peeled = inset > 2 ? ` (border peeled at a ${inset}u inset)` : "";
     const sp = c.style;
     const spacing = ["spacing", "spacingLeft", "spacingRight", "spacingTop", "spacingBottom"]

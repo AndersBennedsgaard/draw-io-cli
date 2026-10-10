@@ -3,16 +3,21 @@ import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { extractMxfile, uncompressMxfile, hasCompressedDiagram, elideImagePayloads, decodeNumericEntities } from "./extract.js";
-import { measure, ICON_GAP_FLAG } from "./measure.js";
+import { pngSize } from "./png.js";
+import { measure, calibrate, predictedExportSize, ICON_GAP_FLAG, EXPORT_CANVAS_LIMIT } from "./measure.js";
 import { renderDiagram, selectPage } from "./render.js";
 import { doctor } from "./doctor.js";
 import { installAssets } from "./install-assets.js";
-import { loadRenderConfig } from "./config.js";
+import { loadConfig } from "./config.js";
 import { lint } from "./lint.js";
 import { cellsReport, cellXml, stylesReport } from "./cells.js";
 import { setGeometry, setWaypoints, setLabelOffset, verifyEdit } from "./edit.js";
-import { diffCells } from "./diff.js";
+import { diffCells, subsetCells } from "./diff.js";
 import { setCurated, isCurated, curatedBanner, guardDiff } from "./curate.js";
+import { comparePair } from "./pair.js";
+import { checkProject, lintOptionsFor as lintOptionsFromConfig, pairVerdict } from "./project.js";
+import { pinnedPolyline, labelAnchor, estimateLabelBox, parseCells } from "./lint.js";
+import { PNG } from "pngjs";
 
 function fail(message) {
   console.error(message);
@@ -181,12 +186,12 @@ function runMeasure(input, options) {
   if (cellIds.length === 0 && gapIds.length === 0 && !affine && !iconGaps) {
     fail("measure needs at least one --cell <id>, --fit <id> or --gaps <id>, --icon-gaps for the sweep, or --affine for the mapping alone");
   }
-  const config = loadRenderConfig(input);
+  const config = loadConfig(input);
   if (config.path !== null && (options.scale === undefined || options.border === undefined)) {
     console.error(`config: ${config.path}`);
   }
-  const scale = options.scale ?? config.scale ?? 3;
-  const border = options.border ?? config.border ?? 10;
+  const scale = options.scale ?? config.render.scale ?? 3;
+  const border = options.border ?? config.render.border ?? 10;
   const raw = readFileSync(input);
   const xml = extractMxfile(raw);
   const report = measure(raw, xml, {
@@ -214,12 +219,12 @@ async function runRender(input, options) {
   if (png === null && svg === null) png = true;
 
   // Precedence: explicit flag, then the nearest drawio.config.json, then built-in default.
-  const config = loadRenderConfig(input);
+  const config = loadConfig(input);
   if (config.path !== null && (options.scale === undefined || options.border === undefined)) {
     console.error(`config: ${config.path}`);
   }
-  const scale = options.scale ?? config.scale ?? 3;
-  const border = options.border ?? config.border ?? 10;
+  const scale = options.scale ?? config.render.scale ?? 3;
+  const border = options.border ?? config.render.border ?? 10;
 
   const raw = readFileSync(input);
   let xml = /\.(png|svg)$/i.test(input) ? extractMxfile(raw) : raw.toString("utf8");
@@ -229,7 +234,23 @@ async function runRender(input, options) {
   const formats = [];
   if (png !== null) formats.push("xmlpng");
   if (svg !== null) formats.push("xmlsvg");
+  // The exporter clamps the long side to its canvas limit and says nothing, so
+  // the prediction refuses first and the PNG's own size is checked after.
+  const predicted = predictedExportSize(uncompressMxfile(xml), { scale, border });
+  if (png !== null && predicted.clamped) {
+    fail(
+      `render refused: the model predicts ${predicted.width}x${predicted.height}px at scale ${scale}, over the ` +
+        `exporter's ${EXPORT_CANVAS_LIMIT}px canvas limit, and the exporter would clamp it silently. ` +
+        `Set render.scale to ${predicted.fittingScale} or lower in drawio.config.json, or split the diagram.`,
+    );
+  }
   const results = await renderDiagram(xml, { formats, scale, border, webapp: options.webapp });
+  if (png !== null) {
+    const size = pngSize(Buffer.from(results.xmlpng));
+    if (size.width === EXPORT_CANVAS_LIMIT || size.height === EXPORT_CANVAS_LIMIT) {
+      fail(`render refused: the exporter clamped the PNG to ${size.width}x${size.height}px (predicted ${predicted.width}x${predicted.height}px), nothing was written`);
+    }
+  }
   const cellCount = (text) => (String(text).match(/<mxCell[\s>]/g) ?? []).length;
   const inputCells = cellCount(xml);
   for (const format of formats) {
@@ -257,7 +278,25 @@ async function runRender(input, options) {
  */
 function readStoredXml(input) {
   const raw = readFileSync(input);
-  return /\.(png|svg)$/i.test(input) ? extractMxfile(raw) : raw.toString("utf8");
+  if (/\.(png|svg)$/i.test(input)) return extractMxfile(raw);
+  assertDrawioSource(input, raw);
+  return raw.toString("utf8");
+}
+
+/**
+ * Refuses a `.drawio` whose bytes are an export (an SVG or a PNG saved under
+ * the source's name). Such a file holds no stored XML, and a reader that
+ * inspected it as one would find zero cells and pass.
+ */
+function assertDrawioSource(input, raw) {
+  const isPng = raw.length >= 8 && raw[0] === 0x89 && raw[1] === 0x50;
+  const isSvg = /^\s*(<\?xml[^>]*>\s*)?(<!DOCTYPE[^>]*>\s*)?<svg\b/i.test(raw.subarray(0, 512).toString("utf8"));
+  if (isPng || isSvg) {
+    fail(
+      `${input} is ${isPng ? "a PNG" : "an SVG"} export saved under a .drawio name, not draw.io source XML: ` +
+        `rename it to .drawio.${isPng ? "png" : "svg"}, or run extract on it to recover the source`,
+    );
+  }
 }
 
 /**
@@ -291,22 +330,81 @@ function runCells(input, options) {
   console.log(cellXml(stored, options.xml, { elideImages: elide }));
 }
 
-function runLint(input, options) {
-  const model = readModelXml(input);
-  const banner = curatedBanner(model);
-  if (banner) console.error(banner);
-  const { errors, warnings, notes } = lint(model);
-  for (const n of notes) console.error(`note: ${n}`);
-  if (banner && notes.length + warnings.length + errors.length > 0) {
-    console.error(
-      "curated: findings above that your edit did not introduce are the curator's decisions: report them, never fix them unbidden",
-    );
+/**
+ * The lint options a config supplies: the repository's label vocabulary and
+ * its palette's styles. `--no-config` leaves every one unset, `--config`
+ * names the file, and otherwise the nearest config above the input applies.
+ */
+function lintOptionsFor(input, options) {
+  const palette = options.palette ?? null;
+  if (options.config === false) {
+    const config = loadConfig(input, null);
+    const empty = { ...config, lint: { ...config.lint, palette: null, files: [], labelFormat: null, verbs: null, subjects: null, codeLabels: null }, path: null };
+    return { ...lintOptionsFromConfig(empty, input, { palette }), path: null };
   }
-  for (const w of warnings) console.error(`warning: ${w}`);
-  for (const e of errors) console.error(`error: ${e}`);
-  const failing = errors.length + (options.strict ? warnings.length : 0);
-  console.log(`${errors.length} error(s), ${warnings.length} warning(s)`);
+  const config = loadConfig(input, typeof options.config === "string" ? options.config : null);
+  return { ...lintOptionsFromConfig(config, input, { palette }), path: config.path };
+}
+
+function runLint(inputs, options) {
+  let failing = 0;
+  const announced = new Set();
+  for (const input of inputs) {
+    if (inputs.length > 1) console.log(`== ${input}`);
+    const { options: lintOptions, path, match } = lintOptionsFor(input, options);
+    if (path !== null && !announced.has(path)) {
+      console.error(`config: ${path}`);
+      announced.add(path);
+    }
+    if (match !== null) console.error(`config: lint.files entry "${match}" applies to ${input}`);
+    const model = readModelXml(input);
+    const banner = curatedBanner(model);
+    if (banner) console.error(banner);
+    const { errors, warnings, notes } = lint(model, lintOptions);
+    for (const n of notes) console.error(`note: ${n}`);
+    if (banner && notes.length + warnings.length + errors.length > 0) {
+      console.error(
+        "curated: findings above that your edit did not introduce are the curator's decisions: report them, never fix them unbidden",
+      );
+    }
+    for (const w of warnings) console.error(`warning: ${w}`);
+    for (const e of errors) console.error(`error: ${e}`);
+    failing += errors.length + (options.strict ? warnings.length : 0);
+    console.log(`${errors.length} error(s), ${warnings.length} warning(s)`);
+  }
   if (failing > 0) process.exit(1);
+}
+
+function runCheckPair(inputs) {
+  let stale = 0;
+  for (const input of inputs) {
+    if (/\.(png|svg)$/i.test(input)) fail(`check-pair takes the .drawio source, and ${input} is a render`);
+    const sibling = `${input}.png`;
+    if (!existsSync(sibling)) {
+      console.log(`${input}: rendered sibling ${sibling} is missing`);
+      stale += 1;
+      continue;
+    }
+    const config = loadConfig(input);
+    const verdict = pairVerdict(readModelXml(input), readFileSync(sibling), {
+      scale: config.render.scale ?? 3, border: config.render.border ?? 10,
+    });
+    if (verdict.fresh) {
+      console.log(`${input}: rendered sibling is fresh`);
+      continue;
+    }
+    stale += 1;
+    console.log(`${input}: ${verdict.summary.replace("rendered sibling is stale", "rendered sibling is STALE, re-render the pair")}`);
+    for (const line of verdict.differences) console.log(`  ${line}`);
+  }
+  if (stale > 0) process.exit(1);
+}
+
+function runCheckProject(dir) {
+  const { lines, failures } = checkProject(dir);
+  for (const line of lines) console.log(line);
+  console.log(`check-project: ${failures} failure(s)`);
+  if (failures > 0) process.exit(1);
 }
 
 /** Reads a .drawio for in-place editing, refusing rendered inputs. */
@@ -314,7 +412,9 @@ function readEditable(input) {
   if (/\.(png|svg)$/i.test(input)) {
     fail("editing verbs write the .drawio source in place: edit the source, then re-render the pair");
   }
-  return readFileSync(input, "utf8");
+  const raw = readFileSync(input);
+  assertDrawioSource(input, raw);
+  return raw.toString("utf8");
 }
 
 function finishEdit(input, edited, id, expect) {
@@ -387,11 +487,123 @@ function runSetLabelOffset(input, id, dxRaw, dyRaw, options, command) {
   finishEdit(input, edited, id, { offset: { x: dx, y: dy } });
 }
 
-function runDiffCells(a, b) {
+function runDiffCells(a, b, options) {
+  if (options.subset) {
+    const { lines, violations } = subsetCells(readModel(a), readModel(b));
+    for (const line of lines) console.log(line);
+    if (violations > 0) process.exit(1);
+    return;
+  }
   const lines = diffCells(readModel(a), readModel(b));
   for (const line of lines) console.log(line);
   console.log(lines.length === 0 ? "cells match (ids, values, styles)" : `${lines.length} difference line(s)`);
   if (lines.length > 0) process.exit(1);
+}
+
+/**
+ * Seats an edge label on the midpoint of one pinned segment of its edge: the
+ * label's relative position becomes that point's arc-length fraction mapped
+ * to -1..1, and its offset centres the estimated text box on the run
+ * (`align=left` hangs the text to the right of the anchor, so it gets minus
+ * half the width, `align=right` plus half, `align=center` nothing).
+ */
+function runSeatLabel(input, id, options, command) {
+  requirePlainId(command, id);
+  const xml = readEditable(input);
+  if (hasCompressedDiagram(xml)) fail("compressed model: run extract first, then seat labels in the uncompressed file");
+  const cells = parseCells(xml);
+  const label = cells.get(id);
+  if (!label) fail(`no cell with id ${id}`);
+  const edge = cells.get(label.attrs.parent);
+  if (edge?.attrs.edge !== "1") fail(`${id} is not an edge label: its parent is not an edge`);
+  const res = pinnedPolyline(cells, edge);
+  if (!res.pts) fail(`edge ${edge.id} has no pinned polyline (${res.missing ? `missing ${res.missing}` : res.nogeo ? "a terminal without geometry" : "floating connection points"}), pin exitX/exitY and entryX/entryY first`);
+  const segments = res.pts.length - 1;
+  const k = options.segment;
+  if (k < 1 || k > segments) fail(`--segment ${k} is out of range: edge ${edge.id} has ${segments} segment(s)`);
+  const lengths = [];
+  let arc = 0;
+  for (let i = 0; i < segments; i += 1) {
+    const len = Math.abs(res.pts[i].x - res.pts[i + 1].x) + Math.abs(res.pts[i].y - res.pts[i + 1].y);
+    lengths.push(len);
+    arc += len;
+  }
+  if (arc === 0) fail(`edge ${edge.id} has no length to seat a label on`);
+  const before = lengths.slice(0, k - 1).reduce((a, b) => a + b, 0);
+  const fraction = (before + lengths[k - 1] / 2) / arc;
+  const position = Math.round((fraction * 2 - 1) * 10000) / 10000;
+  const est = estimateLabelBox(label.attrs.value);
+  const align = label.style.align ?? "center";
+  const dx = align === "left" ? -Math.round(est.w / 2) : align === "right" ? Math.round(est.w / 2) : 0;
+  const dy = (label.style.verticalAlign ?? null) === "middle" ? 0 : -Math.round(est.h / 2 + 4);
+  let edited = setGeometry(xml, id, { x: position });
+  edited = setLabelOffset(edited, id, dx, dy);
+  verifyEdit(edited, id, { offset: { x: dx, y: dy } });
+  const mid = labelAnchor(res.pts, position, null);
+  writeOutput(input, edited);
+  console.error(
+    `seated ${id} on segment ${k} of ${segments} of edge ${edge.id}: position ${position} (midpoint (${Math.round(mid.x)},${Math.round(mid.y)})), ` +
+      `offset ${dx},${dy} for align=${align}; re-render the pair and run lint`,
+  );
+}
+
+/**
+ * Sizes a box to its rendered text under the uniform padding rule, applying
+ * the box `measure --fit` reports. The rendered sibling must be fresh, since
+ * the ink is measured on it.
+ */
+function runFitBox(input, id, options, command) {
+  requirePlainId(command, id);
+  const xml = readEditable(input);
+  const sibling = `${input}.png`;
+  if (!existsSync(sibling)) fail(`fit-box measures the rendered sibling, and ${sibling} is missing: render the pair first`);
+  const config = loadConfig(input);
+  const scale = options.scale ?? config.render.scale ?? 3;
+  const border = options.border ?? config.render.border ?? 10;
+  const png = readFileSync(sibling);
+  const verdict = pairVerdict(uncompressMxfile(xml), png, { scale, border });
+  if (!verdict.fresh) fail(`fit-box refuses a stale sibling: ${verdict.summary}. Render the pair first`);
+  const collect = { fits: [] };
+  const report = measure(png, uncompressMxfile(xml), { cellIds: [id], fitIds: [id], scale, border, quietCalibration: true, collect });
+  const fit = collect.fits.find((f) => f.id === id);
+  if (!fit) fail(`fit-box found no text ink to size ${id} to:\n${report}`);
+  const edited = setGeometry(xml, id, { width: fit.impliedW, height: fit.impliedH });
+  verifyEdit(edited, id, { geo: { width: fit.impliedW, height: fit.impliedH } });
+  writeOutput(input, edited);
+  console.error(`fit ${id} to ${fit.impliedW}x${fit.impliedH}u; re-render the pair`);
+}
+
+/**
+ * Crops a region of a rendered PNG given in model units, mapped to pixels
+ * through the same calibration `measure` uses. A residual larger than the
+ * region would move the crop off its target, so that is the one refusal.
+ */
+function runCrop(input, options) {
+  const m = /^(-?[\d.]+),(-?[\d.]+),([\d.]+),([\d.]+)$/.exec(options.region ?? "");
+  if (!m) fail("--region takes x,y,w,h in model units");
+  const [x, y, w, h] = m.slice(1).map(Number);
+  if (w <= 0 || h <= 0) fail("--region needs a positive width and height");
+  const config = loadConfig(input);
+  const scale = options.scale ?? config.render.scale ?? 3;
+  const border = options.border ?? config.render.border ?? 10;
+  const raw = readFileSync(input);
+  const cal = calibrate(raw, extractMxfile(raw), { scale, border, quietCalibration: true });
+  if (cal.warningLive && (Math.abs(cal.residualW) > w * scale || Math.abs(cal.residualH) > h * scale)) {
+    fail(`crop refused: the calibration residual ${cal.residualW},${cal.residualH}px is larger than the ${w}x${h}u region at scale ${scale}, so the crop could miss it entirely`);
+  }
+  const tl = cal.toPx(x, y), br = cal.toPx(x + w, y + h);
+  const left = Math.max(0, tl.x), top = Math.max(0, tl.y);
+  const right = Math.min(cal.img.width, br.x), bottom = Math.min(cal.img.height, br.y);
+  if (right <= left || bottom <= top) fail(`crop refused: the region maps outside the PNG (${cal.img.width}x${cal.img.height}px)`);
+  const out = new PNG({ width: right - left, height: bottom - top });
+  for (let py = top; py < bottom; py += 1) for (let px = left; px < right; px += 1) {
+    const [r, g, b, a] = cal.img.at(px, py);
+    const at = ((py - top) * out.width + (px - left)) * 4;
+    out.data[at] = r; out.data[at + 1] = g; out.data[at + 2] = b; out.data[at + 3] = a;
+  }
+  const target = options.o ?? input.replace(/\.png$/i, `-crop-${Math.round(x)}-${Math.round(y)}.png`);
+  writeOutput(target, PNG.sync.write(out));
+  console.error(`cropped ${out.width}x${out.height}px at (${left},${top}) for model region ${x},${y} ${w}x${h}u${cal.warningLive ? ` (error bar ${Math.abs(cal.residualW)},${Math.abs(cal.residualH)}px)` : ""}`);
 }
 
 const program = new DrawioCommand()
@@ -424,9 +636,55 @@ program
 program
   .command("lint")
   .description("verify a diagram's routing, labels and cell values from the XML alone")
-  .argument("<input>", "a .drawio, .drawio.png or .drawio.svg file")
+  .argument("<input...>", "one or more .drawio, .drawio.png or .drawio.svg files")
   .option("--strict", "fail on warnings as well as errors")
+  .addOption(valueOption("--config <path>", "the drawio.config.json to apply, in place of the upward search", "--config requires a path"))
+  .option("--no-config", "run the universal checks only, ignoring any drawio.config.json")
+  .addOption(valueOption("--palette <path>", "the palette to check style families against, in place of the config's", "--palette requires a path"))
   .action(runLint);
+
+program
+  .command("seat-label")
+  .description("seat an edge label on the midpoint of one pinned segment of its edge, in place")
+  .argument("<input.drawio>", "the .drawio source to edit")
+  .argument("<id>", "the label cell to seat")
+  .addOption(valueOption("--segment <k>", "the 1-based segment of the edge's pinned polyline to seat on", "--segment requires a segment number", (value) => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1) fail("--segment must be a positive integer");
+    return parsed;
+  }).makeOptionMandatory())
+  .action(runSeatLabel);
+
+program
+  .command("fit-box")
+  .description("size a box to its rendered text under the uniform padding rule, from the fresh rendered sibling")
+  .argument("<input.drawio>", "the .drawio source to edit")
+  .argument("<id>", "the cell to size")
+  .addOption(scaleOption("the scale the sibling was rendered at"))
+  .addOption(borderOption("the border the sibling was rendered with"))
+  .action(runFitBox);
+
+program
+  .command("crop")
+  .description("crop a region of a rendered PNG given in model units")
+  .argument("<input.drawio.png>", "a rendered .drawio.png")
+  .addOption(valueOption("--region <x,y,w,h>", "the region in model units", "--region requires x,y,w,h").makeOptionMandatory())
+  .addOption(valueOption("-o <output>", "the output path, in place of <input>-crop-<x>-<y>.png", "-o requires a path"))
+  .addOption(scaleOption("the scale the PNG was rendered at"))
+  .addOption(borderOption("the border the PNG was rendered with"))
+  .action(runCrop);
+
+program
+  .command("check-pair")
+  .description("verify each .drawio's rendered .drawio.png sibling still carries the source's model")
+  .argument("<input.drawio...>", "one or more .drawio sources")
+  .action(runCheckPair);
+
+program
+  .command("check-project")
+  .description("verify a directory follows the diagram project layout: config, palette, style guide and fresh pairs")
+  .argument("<dir>", "the directory whose diagrams are checked, recursively")
+  .action(runCheckProject);
 
 program
   .command("cells")
@@ -508,6 +766,7 @@ program
   .description("compare two models cell by cell: ids, values and styles")
   .argument("<a>", "a .drawio, .drawio.png or .drawio.svg file")
   .argument("<b>", "a .drawio, .drawio.png or .drawio.svg file")
+  .option("--subset", "prove a is a copy of part of b: shared cells must match, cells only in a are violations")
   .action(runDiffCells);
 
 program
